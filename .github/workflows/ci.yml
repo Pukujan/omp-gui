@@ -27,7 +27,7 @@ jobs:
         env:
           OMP_GUI_USER: ci
           OMP_GUI_PASS_PLAINTEXT: ci-secret
-          OMP_GUI_SESSION_SECRET: ${{ secrets.OMP_GUI_TEST_SECRET || 'ci-test-secret-0123456789abcdef0123456789abcdef' }}
+          OMP_GUI_SESSION_SECRET: ci-tes…cdef
         run: |
           node server/index.js &
           sleep 2
@@ -36,10 +36,10 @@ jobs:
           test "$code" = 401
           curl -fsS -c /tmp/cj -X POST http://127.0.0.1:8790/api/login \
             -H 'content-type: application/json' \
-            -d '{"username":"ci","password":"***"}' | grep -q '"ok":true'
+            -d "{\"username\":\"ci\",\"password\":\"$OMP_GUI_PASS_PLAINTEXT\"}" | grep -q '"ok":true'
           test -s /tmp/cj
           bad=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8790/api/login \
-            -H 'content-type: application/json' -d '{"username":"ci","password":"***"}')
+            -H 'content-type: application/json' -d '{"username":"ci","password":"nope-not-it"}')
           test "$bad" = 401
       - name: Docker build
         run: docker build -t omp-gui:ci .
