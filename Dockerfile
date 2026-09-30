@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # omp native binary (Linux x64) into /usr/local/bin; agent home /root/.omp (mount for auth)
 ENV PI_INSTALL_DIR=/usr/local/bin
-RUN curl -fsSL https://omp.sh/install | sh -- --binary && omp --version
+RUN curl -fsSL https://omp.sh/install | sh -s -- --binary && omp --version
 
 WORKDIR /app
 COPY server/package.json server/
