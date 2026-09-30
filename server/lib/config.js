@@ -32,7 +32,7 @@ const config = {
       ? process.env.OMP_GUI_SESSION_SECRET
       : crypto.randomBytes(32).toString("hex"),
   SESSION_TTL_MS: 30 * 24 * 3600e3,
-  OMP_BIN: process.env.OMP_BIN || (os.platform() === "win32" ? "omp" : "/usr/local/bin/omp"),
+  OMP_BIN: process.env.OMP_BIN || "omp",
   IDLE_KILL_MS: 30 * 60e3,
   MAX_SESSIONS: Number(process.env.OMP_GUI_MAX_SESSIONS || 8),
   IRE_ROOT: process.env.IRE_ROOT || "D:/claude/inference-recommendation-engine",
@@ -43,6 +43,17 @@ const config = {
   RATE_MAX: 10,
   LOCKOUT_MS: 15 * 60e3,
 };
+// `omp` may not be on PATH (Linux installs to ~/.local/bin, Windows to
+// %LOCALAPPDATA%\omp). Try the configured binary, then the known locations.
+config.OMP_CANDIDATES = [
+  config.OMP_BIN,
+  "omp",
+  path.join(os.homedir(), ".local", "bin", "omp"),
+  "/usr/local/bin/omp",
+  path.join(os.homedir(), "AppData", "Local", "omp", "omp.exe"),
+  "C:\\Users\\pujan\\AppData\\Local\\omp\\omp.exe",
+].filter((v, i, a) => v && a.indexOf(v) === i);
+
 config.PEPPER = path.join(config.DATA_DIR, "pepper.key");
 fs.mkdirSync(config.DATA_DIR, { recursive: true });
 if (!fs.existsSync(config.PEPPER)) fs.writeFileSync(config.PEPPER, crypto.randomBytes(32).toString("hex"));

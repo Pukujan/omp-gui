@@ -34,6 +34,8 @@ class RpcSession {
     this.onNotify = onNotify;
     this.log = log;
     this.state = { streaming: false, model: null, thinkingLevel: null, sessionFile: null, sessionId: null, todos: [], title: null };
+    this.binIndex = 0;
+    this.bin = config.OMP_CANDIDATES[0];
     this.spawn();
   }
 
@@ -48,8 +50,8 @@ class RpcSession {
 
   spawn() {
     const args = this.spawnArgs();
-    this.log(`spawn omp ${args.join(" ")} (chat ${this.chatId} kind=${this.kind})`);
-    this.proc = spawn(config.OMP_BIN, args, { cwd: this.cwd, env: process.env, shell: false, windowsHide: true });
+    this.log(`spawn ${this.bin} ${args.join(" ")} (chat ${this.chatId} kind=${this.kind})`);
+    this.proc = spawn(this.bin, args, { cwd: this.cwd, env: process.env, shell: false, windowsHide: true });
     this.proc.stdout.on("data", (d) => this.onStdout(d));
     this.proc.stderr.on("data", (d) => {
       const s = String(d);
@@ -65,6 +67,14 @@ class RpcSession {
       this.onExit?.(this);
     });
     this.proc.on("error", (e) => {
+      // a missing binary is recoverable: try the next known install location
+      if (e.code === "ENOENT" && !this.ready && this.binIndex < config.OMP_CANDIDATES.length - 1) {
+        this.binIndex++;
+        this.bin = config.OMP_CANDIDATES[this.binIndex];
+        this.log(`omp not found at previous path, retrying: ${this.bin}`);
+        setTimeout(() => { if (!this.dead && !this.ready) this.spawn(); }, 50);
+        return;
+      }
       this.broadcast({ type: "server_event", event: "spawn_error", error: String(e) });
       this.log(`spawn error ${this.chatId}: ${e}`);
     });
