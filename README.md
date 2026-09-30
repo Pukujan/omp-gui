@@ -45,8 +45,9 @@ provider breadth, runtime evidence, deterministic policy. Each entry carries
 `reasons` (`low_availability`, `insufficient_provider_breadth`,
 `insufficient_runtime_evidence`, …) plus cost, throughput, vision/reasoning flags
 and thinking levels. Filters: `?vision=1&free=1&reasoning=1&q=`. Without the
-engine checkout the endpoint degrades to a local price/throughput ordering — it
-never returns an empty list.
+engine checkout the endpoint degrades to a local price/throughput ordering. On a
+host with no configured providers the response is `{available:false, reason}`
+rather than an error, and the UI says so.
 
 ## Image generation and vision
 
