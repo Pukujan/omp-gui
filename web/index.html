@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#212121">
+<title>omp</title>
+<link rel="stylesheet" href="/app.css">
+<link rel="manifest" href="/manifest.webmanifest">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="side-head">
+      <span class="brand"><svg width="22" height="22" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" fill="#10a37f"/><text x="12" y="16.5" text-anchor="middle" font-size="11" fill="#fff" font-family="sans-serif">π</text></svg> omp</span>
+      <button id="collapse" title="hide sidebar">⟨</button>
+    </div>
+    <button id="new-chat" class="new-chat">✏️ New chat</button>
+    <div id="project-list" class="projects"></div>
+    <button id="add-project" class="ghost add">＋ Add project</button>
+    <div class="side-foot"><span id="whoami"></span><button id="logout" class="ghost">Log out</button></div>
+  </aside>
+
+  <main id="main">
+    <header id="topbar">
+      <button id="menu" class="icon" title="menu">☰</button>
+      <div id="chat-title" class="chat-title"></div>
+      <div class="spacer"></div>
+      <button id="toggle-agents" class="icon" title="subagents">🛰</button>
+    </header>
+
+    <section id="chat" class="chat">
+      <div id="welcome" class="welcome">
+        <h1>What should we work on?</h1>
+        <div class="hint">Pick a project from the sidebar, then chat or run the agent on your machine.</div>
+      </div>
+      <div id="thread" class="thread hidden"></div>
+    </section>
+
+    <footer id="composer-wrap">
+      <div id="statusline" class="statusline hidden"></div>
+      <div id="queue" class="queue hidden"></div>
+      <form id="composer" class="composer hidden">
+        <textarea id="input" rows="1" placeholder="Message…" autocomplete="off"></textarea>
+        <div class="composer-row">
+          <button type="button" id="model-btn" class="pill" title="model"><span id="model-name">model</span> ▾</button>
+          <button type="button" id="think-btn" class="pill hidden" title="thinking">thinking ▾</button>
+          <div class="spacer"></div>
+          <button type="button" id="steer-btn" class="pill hidden" title="send as steering message">steer</button>
+          <button type="submit" id="send" class="send" title="send">↑</button>
+        </div>
+      </form>
+    </footer>
+  </main>
+
+  <aside id="agents" class="agents hidden">
+    <div class="agents-head">Subagents <button id="close-agents" class="icon">✕</button></div>
+    <div id="agents-body" class="agents-body"></div>
+  </aside>
+</div>
+
+<div id="login" class="modal-backdrop">
+  <form id="login-form" class="modal">
+    <h2>omp</h2>
+    <div class="sub">sign in to your machine</div>
+    <input id="l-user" placeholder="username" autocomplete="username">
+    <input id="l-pass" type="password" placeholder="password" autocomplete="current-password">
+    <div id="l-err" class="err"></div>
+    <button type="submit" class="primary">Log in</button>
+  </form>
+</div>
+
+<div id="model-pop" class="popover hidden"></div>
+<div id="think-pop" class="popover hidden"></div>
+<div id="project-pop" class="popover hidden"></div>
+
+<template id="tpl-project">
+  <div class="project">
+    <button class="proj-name"></button>
+    <span class="proj-caret">▾</span>
+    <div class="sess-list"></div>
+  </div>
+</template>
+<template id="tpl-msg">
+  <div class="msg"><div class="bubble md"></div></div>
+</template>
+<template id="tpl-tool">
+  <details class="tool"><summary><span class="tname"></span> <span class="tsum"></span></summary><pre class="tbody"></pre></details>
+</template>
+
+<script src="/marked.min.js"></script>
+<script src="/purify.min.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

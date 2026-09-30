@@ -1,0 +1,20 @@
+services:
+  omp-gui:
+    build: .
+    image: omp-gui:latest
+    container_name: omp-gui
+    ports:
+      - "127.0.0.1:8790:8790"   # tailscale serve fronts this on gravebuster
+    environment:
+      OMP_GUI_USER: ${OMP_GUI_USER:-pukujan}
+      OMP_GUI_PASS_PLAINTEXT: ${OMP_GUI_PASS_PLAINTEXT:?set in .env}
+      OMP_GUI_SESSION_SECRET: ${OMP_GUI_SESSION_SECRET:?set in .env}
+      OMP_GUI_ORIGIN: ${OMP_GUI_ORIGIN:-https://omp.design-bakery.com}
+    volumes:
+      - omp-data:/data
+      - omp-home:/root/.omp     # provider auth + models.yml live here
+    restart: unless-stopped
+
+volumes:
+  omp-data:
+  omp-home:
