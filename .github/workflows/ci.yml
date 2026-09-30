@@ -20,6 +20,7 @@ jobs:
         run: cd server && npm install --omit=dev
       - name: Syntax check
         run: |
+          shopt -s nullglob
           for f in server/index.js server/lib/*.js web/app.js web/js/*.js scripts/smoke.js scripts/test-server.js; do
             node --check "$f"
           done
@@ -41,7 +42,9 @@ jobs:
           bad=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8790/api/login \
             -H 'content-type: application/json' -d '{"username":"ci","password":"nope-not-it"}')
           test "$bad" = 401
-      - name: API + isolation tests (one real agent turn)
+      # No provider credentials on hosted runners: the paid turn test stays
+      # skipped unless OMG_TEST_TURN=1 (set locally, where auth exists).
+      - name: API + isolation + framing tests
         env:
           OMP_GUI_USER: ci
           OMP_GUI_PASS_PLAINTEXT: ci-secret
