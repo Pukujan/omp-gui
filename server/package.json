@@ -1,15 +1,15 @@
 {
-  "name": "server",
-  "version": "1.0.0",
-  "description": "",
+  "name": "omp-gui-server",
+  "version": "0.2.0",
+  "private": true,
+  "description": "omp-gui server: web front-end for `omp --mode rpc` (one agent session per GUI chat)",
   "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node ../scripts/test-server.js"
+  },
+  "license": "MIT",
   "dependencies": {
     "ws": "^8.22.0"
   }
