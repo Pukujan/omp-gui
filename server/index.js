@@ -21,8 +21,10 @@ const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 // ---------- model catalog (cached from a live/ephemeral rpc session) ----------
 let modelsCache = { at: 0, data: null };
 const MODELS_TTL = 10 * 60e3;
+const MODELS_FAIL_TTL = 60e3; // don't spawn a probe on every request while it is unavailable
 async function getModels() {
   if (modelsCache.data && Date.now() - modelsCache.at < MODELS_TTL) return modelsCache.data;
+  if (!modelsCache.data && modelsCache.at && Date.now() - modelsCache.at < MODELS_FAIL_TTL) return null;
   const live = pool.all().find((s) => s.models);
   if (live) { modelsCache = { at: Date.now(), data: live.models }; return live.models; }
   // ephemeral probe session: no GUI chat owns it, killed as soon as it answers
@@ -47,6 +49,7 @@ async function getModels() {
     }, 250);
   });
   try { probe.dispose(); } catch {}
+  if (!ok) modelsCache = { at: Date.now(), data: null };
   return ok ? modelsCache.data : null;
 }
 
@@ -161,7 +164,11 @@ const server = http.createServer(async (req, res) => {
   // ---- models (ranked by the Inference Recommendation Engine) ----
   if (p === "/api/models") {
     const data = await getModels();
-    if (!data || !Array.isArray(data.models)) return json(res, 503, { error: "model catalog unavailable" });
+    // No providers configured (or omp cannot report a catalog): say so explicitly
+    // instead of failing the picker — the UI shows a notice and the rest works.
+    if (!data || !Array.isArray(data.models)) {
+      return json(res, 200, { available: false, reason: "model catalog unavailable (no configured providers?)", engineVersion: null, count: 0, models: [] });
+    }
     const ranked = await modelRank.rank(data.models, {
       vision: url.searchParams.get("vision") === "1",
       free: url.searchParams.get("free") === "1",
@@ -169,7 +176,7 @@ const server = http.createServer(async (req, res) => {
       query: url.searchParams.get("q") || "",
       limit: Number(url.searchParams.get("limit") || 0) || 0,
     });
-    return json(res, 200, ranked);
+    return json(res, 200, { available: true, ...ranked });
   }
 
   // ---- image generation ----
