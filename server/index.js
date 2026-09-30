@@ -1,236 +1,58 @@
 #!/usr/bin/env node
-// omp-gui server: ChatGPT-style web front for `omp --mode rpc`.
-// Single-user auth (scrypt + cookie), per-project rpc session pool, WS event relay.
+// omp-gui server v0.2.0 — ChatGPT-style web front for `omp --mode rpc`.
+// Modules: lib/config, lib/auth, lib/projects, lib/rpc, lib/pool, lib/models, lib/images.
+// One omp process per GUI chat (clean context), cwd = the project's launch folder.
 "use strict";
-
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
-const os = require("node:os");
-const crypto = require("node:crypto");
-const { spawn } = require("node:child_process");
 const { WebSocketServer } = require("ws");
 
-// ---------- env ----------
-function loadEnv() {
-  const file = path.join(__dirname, "..", ".env");
-  if (!fs.existsSync(file)) return;
-  for (const line of fs.readFileSync(file, "utf8").split(/\r?\n/)) {
-    const m = line.match(/^([A-Z0-9_]+)=(.*)$/i);
-    if (m && !(m[1] in process.env)) process.env[m[1]] = m[2];
-  }
-}
-loadEnv();
+const config = require("./lib/config");
+const auth = require("./lib/auth");
+const projects = require("./lib/projects");
+const pool = require("./lib/pool");
+const modelRank = require("./lib/models");
+const images = require("./lib/images");
 
-const PORT = Number(process.env.OMP_GUI_PORT || 8790);
-const HOST = process.env.OMP_GUI_HOST || "0.0.0.0";
-const DATA_DIR = process.env.OMP_GUI_DATA || path.join(__dirname, "..", "data");
-const WEB_DIR = path.join(__dirname, "..", "web");
-const USER = process.env.OMP_GUI_USER || "admin";
-const PASS = process.env.OMP_GUI_PASS_PLAINTEXT || "";
-const SECRET =
-  process.env.OMP_GUI_SESSION_SECRET && process.env.OMP_GUI_SESSION_SECRET !== "CHANGE_ME"
-    ? process.env.OMP_GUI_SESSION_SECRET
-    : crypto.randomBytes(32).toString("hex");
-const SESSION_TTL_MS = 30 * 24 * 3600e3;
-const OMP_BIN = process.env.OMP_BIN || (os.platform() === "win32" ? "omp" : "/usr/local/bin/omp");
-const IDLE_KILL_MS = 30 * 60e3;
-const MAX_SESSIONS = Number(process.env.OMP_GUI_MAX_SESSIONS || 8);
+const { PORT, HOST, DATA_DIR, WEB_DIR, VERSION } = config;
+const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
-fs.mkdirSync(path.join(DATA_DIR, "projects"), { recursive: true });
-
-// ---------- auth ----------
-const passHash = PASS ? crypto.scryptSync(PASS, "omp-gui-pepper", 64) : null;
-const rate = new Map(); // ip -> {hits:[ts], lockUntil:ts}
-const RATE_WINDOW = 60e3, RATE_MAX = 10, LOCKOUT_MS = 15 * 60e3;
-
-function clientIp(req) {
-  return (req.socket.remoteAddress || "?").replace(/^::ffff:/, "");
-}
-function rateLimited(ip) {
-  const e = rate.get(ip);
-  if (!e) return 0;
-  if (e.lockUntil && Date.now() < e.lockUntil) return e.lockUntil - Date.now();
-  return 0;
-}
-function rateHit(ip) {
-  const now = Date.now();
-  let e = rate.get(ip);
-  if (!e) { e = { hits: [], lockUntil: 0 }; rate.set(ip, e); }
-  if (e.lockUntil && now < e.lockUntil) return true;
-  e.hits = e.hits.filter((t) => now - t < RATE_WINDOW);
-  if (e.hits.length >= RATE_MAX) { e.lockUntil = now + LOCKOUT_MS; e.hits = []; return true; }
-  e.hits.push(now);
-  return false;
-}
-function makeToken() {
-  const exp = Date.now() + SESSION_TTL_MS;
-  const body = `${USER}.${exp}`;
-  const sig = crypto.createHmac("sha256", SECRET).update(body).digest("base64url");
-  return `${body}.${sig}`;
-}
-function checkToken(tok) {
-  if (!tok) return false;
-  const i = tok.lastIndexOf(".");
-  if (i < 0) return false;
-  const body = tok.slice(0, i), sig = tok.slice(i + 1);
-  const want = crypto.createHmac("sha256", SECRET).update(body).digest("base64url");
-  const a = Buffer.from(sig), b = Buffer.from(want);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
-  const [user, exp] = body.split(".");
-  return user === USER && Number(exp) > Date.now();
-}
-function cookies(req) {
-  const out = {};
-  for (const p of (req.headers.cookie || "").split(";")) {
-    const i = p.indexOf("=");
-    if (i > 0) out[p.slice(0, i).trim()] = decodeURIComponent(p.slice(i + 1).trim());
-  }
-  return out;
-}
-const authed = (req) => checkToken(cookies(req).omg_session);
-const secureFlag = (req) =>
-  (req.headers["x-forwarded-proto"] || "").includes("https") || req.socket.encrypted ? "; Secure" : "";
-
-// ---------- projects ----------
-const PROJECTS_FILE = path.join(DATA_DIR, "projects.json");
-function loadProjects() {
-  try { return JSON.parse(fs.readFileSync(PROJECTS_FILE, "utf8")); } catch { return []; }
-}
-function saveProjects(list) {
-  fs.writeFileSync(PROJECTS_FILE, JSON.stringify(list, null, 2));
-}
-function slug(s) {
-  return s.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "p";
+// ---------- model catalog (cached from a live/ephemeral rpc session) ----------
+let modelsCache = { at: 0, data: null };
+const MODELS_TTL = 10 * 60e3;
+async function getModels() {
+  if (modelsCache.data && Date.now() - modelsCache.at < MODELS_TTL) return modelsCache.data;
+  const live = pool.all().find((s) => s.models);
+  if (live) { modelsCache = { at: Date.now(), data: live.models }; return live.models; }
+  // ephemeral probe session: no GUI chat owns it, killed as soon as it answers
+  const { RpcSession } = require("./lib/rpc");
+  const pr = projects.loadProjects()[0];
+  if (!pr) return null;
+  const dir = projects.sessionDir(pr);
+  const probe = new RpcSession({
+    id: "models-probe", chatId: "models-probe", project: pr, sessionDir: dir, cwd: pr.path,
+    kind: "chat", approval: "always-ask", fetchModels: true, log: () => {},
+    onFrame: (s, f) => {
+      if (f.type === "response" && f.command === "get_available_models") {
+        modelsCache = { at: Date.now(), data: f.success ? f.data : null };
+        setTimeout(() => s.dispose(), 200);
+      }
+    },
+  });
+  const ok = await new Promise((resolve) => {
+    const t0 = Date.now();
+    const iv = setInterval(() => {
+      if (modelsCache.data || probe.dead || Date.now() - t0 > 45e3) { clearInterval(iv); resolve(!!modelsCache.data); }
+    }, 250);
+  });
+  try { probe.dispose(); } catch {}
+  return ok ? modelsCache.data : null;
 }
 
-// ---------- omp rpc client pool ----------
-// One spawned `omp --mode rpc` per gui session id. Browser WS attaches; frames relayed both ways.
-class RpcSession {
-  constructor({ id, project, sessionDir, cwd }) {
-    this.id = id;
-    this.project = project;
-    this.cwd = cwd;
-    this.sessionDir = sessionDir;
-    this.proc = null;
-    this.ready = false;
-    this.buf = "";
-    this.buffer = []; // replay ring for reconnects
-    this.bufferBytes = 0;
-    this.clients = new Set();
-    this.reqSeq = 0;
-    this.lastActivity = Date.now();
-    this.pendingUi = new Map();
-    this.state = { streaming: false, model: null, sessionFile: null, sessionId: null, todos: [] };
-    this.spawn();
-  }
-  spawn() {
-    const args = ["--mode", "rpc", "--cwd", this.cwd, "--session-dir", this.sessionDir, "--no-title"];
-    log(`spawn ${OMP_BIN} ${args.join(" ")} (session ${this.id})`);
-    this.proc = spawn(OMP_BIN, args, { cwd: this.cwd, env: process.env, shell: false, windowsHide: true });
-    this.proc.stdout.on("data", (d) => this.onStdout(d));
-    this.proc.stderr.on("data", (d) => {
-      const s = String(d);
-      if (/\S/.test(s)) log(`[omp ${this.id}] ${s.trim()}`);
-    });
-    this.proc.on("exit", (code) => {
-      this.ready = false;
-      this.dead = true;
-      this.broadcast({ type: "server_event", event: "process_exit", code });
-      for (const ws of this.clients) { try { ws.close(1011, "agent exited"); } catch {} }
-      this.clients.clear();
-      sessions.delete(this.id);
-    });
-    this.proc.on("error", (e) => {
-      this.broadcast({ type: "server_event", event: "spawn_error", error: String(e) });
-      log(`spawn error ${this.id}: ${e}`);
-    });
-  }
-  onStdout(chunk) {
-    this.buf += chunk.toString("utf8");
-    let nl;
-    while ((nl = this.buf.indexOf("\n")) >= 0) {
-      const line = this.buf.slice(0, nl).trim();
-      this.buf = this.buf.slice(nl + 1);
-      if (!line) continue;
-      let frame;
-      try { frame = JSON.parse(line); } catch { log(`bad frame from ${this.id}: ${line.slice(0,120)}`); continue; }
-      this.trackState(frame);
-      this.remember(frame);
-      this.broadcast(frame);
-    }
-  }
-  trackState(f) {
-    if (f.type === "ready") { this.ready = true; this.version = f.protocolVersion; }
-    else if (f.type === "agent_start") this.state.streaming = true;
-    else if (f.type === "agent_end") this.state.streaming = f.isTerminal !== false ? false : this.state.streaming;
-    else if (f.type === "session_settled") this.state.streaming = false;
-    else if (f.type === "response" && f.command === "get_state" && f.success) {
-      this.state.model = f.data?.model || this.state.model;
-      this.state.sessionFile = f.data?.sessionFile || this.state.sessionFile;
-      this.state.sessionId = f.data?.sessionId || this.state.sessionId;
-    } else if (f.type === "model_changed") this.state.model = f.model || f;
-  }
-  remember(f) {
-    const s = JSON.stringify(f);
-    this.buffer.push(s);
-    this.bufferBytes += s.length;
-    while (this.buffer.length > 2000 || this.bufferBytes > 6e6) {
-      this.bufferBytes -= this.buffer.shift().length;
-    }
-  }
-  send(obj) {
-    if (!this.proc || this.dead) return false;
-    this.proc.stdin.write(JSON.stringify(obj) + "\n");
-    this.lastActivity = Date.now();
-    return true;
-  }
-  rpc(type, extra = {}) {
-    return this.send({ id: `gui-${++this.reqSeq}`, type, ...extra });
-  }
-  broadcast(f) {
-    const s = JSON.stringify(f);
-    for (const ws of this.clients) if (ws.readyState === 1) ws.send(s);
-  }
-  attach(ws) {
-    this.clients.add(ws);
-    this.lastActivity = Date.now();
-    ws.send(JSON.stringify({ type: "server_event", event: "hello", sessionId: this.id, ready: this.ready, state: this.state }));
-    for (const s of this.buffer) if (ws.readyState === 1) ws.send(s);
-    this.rpc("get_state");
-  }
-  dispose() {
-    try { this.proc?.kill(); } catch {}
-  }
-}
-
-const sessions = new Map(); // id -> RpcSession
-
-function ensureSession(project, resumeFile) {
-  const dir = path.join(DATA_DIR, "projects", slug(project.name), "sessions");
-  fs.mkdirSync(dir, { recursive: true });
-  const id = crypto.randomUUID();
-  const s = new RpcSession({ id, project, sessionDir: dir, cwd: project.path });
-  sessions.set(id, s);
-  if (resumeFile) s.rpc("open_session", { sessionDir: dir });
-  return s;
-}
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, s] of sessions) {
-    if (s.clients.size === 0 && now - s.lastActivity > IDLE_KILL_MS) {
-      log(`idle-kill ${id}`);
-      s.dispose();
-      sessions.delete(id);
-    }
-  }
-}, 60e3);
-
-// ---------- http ----------
-const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png", ".webmanifest": "application/manifest+json", ".json": "application/json" };
-function serveStatic(req, res, file) {
+// ---------- http helpers ----------
+const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".webp": "image/webp", ".webmanifest": "application/manifest+json", ".json": "application/json", ".ico": "image/x-icon" };
+function serveStatic(res, file) {
   fs.readFile(file, (err, buf) => {
     if (err) { res.writeHead(404); res.end("not found"); return; }
     res.writeHead(200, { "content-type": MIME[path.extname(file)] || "application/octet-stream", "cache-control": "no-cache" });
@@ -238,14 +60,13 @@ function serveStatic(req, res, file) {
   });
 }
 function json(res, code, obj) {
-  const s = JSON.stringify(obj);
   res.writeHead(code, { "content-type": "application/json" });
-  res.end(s);
+  res.end(JSON.stringify(obj));
 }
-function readBody(req) {
+function readBody(req, max = 12e6) {
   return new Promise((resolve, reject) => {
     let b = "";
-    req.on("data", (c) => { b += c; if (b.length > 1e6) { reject(new Error("body too large")); req.destroy(); } });
+    req.on("data", (c) => { b += c; if (b.length > max) { reject(new Error("body too large")); req.destroy(); } });
     req.on("end", () => { try { resolve(b ? JSON.parse(b) : {}); } catch (e) { reject(e); } });
     req.on("error", reject);
   });
@@ -253,168 +74,244 @@ function readBody(req) {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
-  const p = url.pathname;
-  const ip = clientIp(req);
+  const p = decodeURIComponent(url.pathname);
+  const ip = auth.clientIp(req);
 
-  if (p === "/api/health") return json(res, 200, { ok: true, omp: OMP_BIN, sessions: sessions.size });
+  if (p === "/api/health") return json(res, 200, { ok: true, version: VERSION, sessions: pool.all().length, omp: config.OMP_BIN });
 
   if (p === "/api/login" && req.method === "POST") {
-    const lock = rateLimited(ip);
+    const lock = auth.lockRemainingMs(ip);
     if (lock) return json(res, 429, { error: `too many attempts; locked for ${Math.ceil(lock / 60000)} min` });
     let body;
     try { body = await readBody(req); } catch { return json(res, 400, { error: "bad json" }); }
-    rateHit(ip);
-    const uOk = body.username === USER;
-    const pOk =
-      passHash && typeof body.password === "string" &&
-      crypto.timingSafeEqual(crypto.scryptSync(body.password, "omp-gui-pepper", 64), passHash);
-    if (!uOk || !pOk) return json(res, 401, { error: "invalid credentials" });
+    auth.rateHit(ip);
+    if (body.username !== config.USER || !auth.verifyPassword(body.password)) return json(res, 401, { error: "invalid credentials" });
+    const sid = auth.newSid();
     res.writeHead(200, {
       "content-type": "application/json",
-      "set-cookie": `omg_session=${makeToken()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL_MS / 1000}${secureFlag(req)}`,
+      "set-cookie": `omg_session=${auth.makeToken(sid)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${config.SESSION_TTL_MS / 1000}${auth.secureFlag(req)}`,
     });
-    res.end(JSON.stringify({ ok: true, user: USER }));
-    return;
+    return res.end(JSON.stringify({ ok: true, user: config.USER, version: VERSION }));
   }
 
   if (p === "/api/logout" && req.method === "POST") {
-    res.writeHead(200, { "content-type": "application/json", "set-cookie": `omg_session=; Path=/; HttpOnly; Max-Age=0${secureFlag(req)}` });
+    auth.dropSids();
+    res.writeHead(200, { "content-type": "application/json", "set-cookie": `omg_session=; Path=/; HttpOnly; Max-Age=0${auth.secureFlag(req)}` });
     return res.end('{"ok":true}');
   }
 
-  // static assets are public (no secrets); the login page must load before a
-  // session cookie exists.
+  // static assets are public; the login page must load before a cookie exists
   if (req.method === "GET" || req.method === "HEAD") {
-    let file = p === "/" ? "/index.html" : p;
-    file = path.normalize(file).replace(/^([.][.][\/\\])+/, "");
-    const full = path.join(WEB_DIR, file);
-    if (!full.startsWith(WEB_DIR)) { res.writeHead(403); return res.end(); }
-    if (fs.existsSync(full) && fs.statSync(full).isFile()) return serveStatic(req, res, full);
+    const rel = p === "/" ? "/index.html" : p;
+    const full = path.join(WEB_DIR, path.normalize(rel).replace(/^(\.\.[/\\])+/, ""));
+    if (full.startsWith(WEB_DIR) && fs.existsSync(full) && fs.statSync(full).isFile()) return serveStatic(res, full);
   }
 
-  if (!authed(req)) return json(res, 401, { error: "unauthorized" });
+  if (!auth.authed(req)) return json(res, 401, { error: "unauthorized" });
 
-  if (p === "/api/me") return json(res, 200, { user: USER });
+  if (p === "/api/me") return json(res, 200, { user: config.USER, version: VERSION, imageGen: images.configured() });
 
+  // ---- projects ----
   if (p === "/api/projects" && req.method === "GET") {
-    const list = loadProjects().map((pr) => {
-      const dir = path.join(DATA_DIR, "projects", slug(pr.name), "sessions");
-      let files = [];
-      try { files = fs.readdirSync(dir).filter((f) => f.endsWith(".jsonl")); } catch {}
-      return { ...pr, sessionCount: files.length };
-    });
+    const pins = projects.loadPins();
+    const list = projects.loadProjects().map((pr) => ({
+      ...pr,
+      pinned: pins.projects.includes(pr.name),
+      sessionCount: projects.listSessions(pr, 999).length,
+      live: pool.countForProject(pr.id),
+    }));
     return json(res, 200, { projects: list });
   }
   if (p === "/api/projects" && req.method === "POST") {
     let body;
     try { body = await readBody(req); } catch { return json(res, 400, { error: "bad json" }); }
     const name = String(body.name || "").trim().slice(0, 60);
-    let cw = String(body.path || "").trim();
+    const cw = String(body.path || "").trim();
     if (!name || !cw) return json(res, 400, { error: "name and path required" });
-    cw = path.resolve(cw);
-    if (!fs.existsSync(cw) || !fs.statSync(cw).isDirectory()) return json(res, 400, { error: "path is not a directory" });
-    const list = loadProjects();
-    if (list.some((x) => x.name === name)) return json(res, 409, { error: "project name exists" });
-    const pr = { id: crypto.randomUUID(), name, path: cw, added: Date.now() };
-    list.push(pr);
-    saveProjects(list);
-    return json(res, 200, { project: pr });
+    const abs = path.resolve(cw);
+    if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) return json(res, 400, { error: "path is not a directory" });
+    const r = projects.addProject(name, abs);
+    return r.error ? json(res, 409, { error: r.error }) : json(res, 200, { project: r.project });
   }
-  const delMatch = p.match(/^\/api\/projects\/([^/]+)$/);
-  if (delMatch && req.method === "DELETE") {
-    const list = loadProjects();
-    const next = list.filter((x) => x.id !== delMatch[1]);
-    if (next.length === list.length) return json(res, 404, { error: "no such project" });
-    saveProjects(next);
+  const projMatch = p.match(/^\/api\/projects\/([^/]+)$/);
+  if (projMatch && req.method === "DELETE") {
+    const r = projects.removeProject(projMatch[1]);
+    return r.error ? json(res, 404, { error: r.error }) : json(res, 200, { ok: true });
+  }
+  const sessMatch = p.match(/^\/api\/projects\/([^/]+)\/sessions$/);
+  if (sessMatch && req.method === "GET") {
+    const pr = projects.findProject(sessMatch[1]);
+    if (!pr) return json(res, 404, { error: "no such project" });
+    return json(res, 200, { project: pr, sessions: projects.listSessions(pr, 100) });
+  }
+  if (p === "/api/recent") return json(res, 200, { sessions: projects.recent(Number(url.searchParams.get("limit") || 40)) });
+  if (p === "/api/search") return json(res, 200, { results: projects.search(url.searchParams.get("q") || "") });
+
+  // ---- pins ----
+  if (p === "/api/pins" && req.method === "GET") return json(res, 200, projects.loadPins());
+  if (p === "/api/pins" && req.method === "POST") {
+    let body;
+    try { body = await readBody(req); } catch { return json(res, 400, { error: "bad json" }); }
+    const kind = body.kind === "chat" ? "chat" : "project";
+    const key = String(body.key || "");
+    if (!key) return json(res, 400, { error: "key required" });
+    return json(res, 200, projects.togglePin(kind, key));
+  }
+
+  // ---- models (ranked by the Inference Recommendation Engine) ----
+  if (p === "/api/models") {
+    const data = await getModels();
+    if (!data || !Array.isArray(data.models)) return json(res, 503, { error: "model catalog unavailable" });
+    const ranked = await modelRank.rank(data.models, {
+      vision: url.searchParams.get("vision") === "1",
+      free: url.searchParams.get("free") === "1",
+      reasoning: url.searchParams.get("reasoning") === "1",
+      query: url.searchParams.get("q") || "",
+      limit: Number(url.searchParams.get("limit") || 0) || 0,
+    });
+    return json(res, 200, ranked);
+  }
+
+  // ---- image generation ----
+  if (p === "/api/image" && req.method === "POST") {
+    let body;
+    try { body = await readBody(req); } catch { return json(res, 400, { error: "bad json" }); }
+    try {
+      const r = await images.generate(body);
+      return json(res, r.error ? 502 : 200, r);
+    } catch (e) {
+      return json(res, 502, { error: String(e.message || e) });
+    }
+  }
+  const imgMatch = p.match(/^\/api\/images\/([A-Za-z0-9._-]+)$/);
+  if (imgMatch && req.method === "GET") {
+    const f = images.filePath(imgMatch[1]);
+    if (!f) return json(res, 404, { error: "no such image" });
+    return serveStatic(res, f);
+  }
+
+  // ---- capabilities (skills / plugins / MCP) ----
+  if (p === "/api/capabilities") return json(res, 200, capabilities());
+
+  // ---- feedback ----
+  if (p === "/api/feedback" && req.method === "POST") {
+    let body;
+    try { body = await readBody(req); } catch { return json(res, 400, { error: "bad json" }); }
+    const rec = { at: new Date().toISOString(), user: config.USER, ...body };
+    fs.appendFileSync(path.join(DATA_DIR, "feedback.jsonl"), JSON.stringify(rec) + "\n");
     return json(res, 200, { ok: true });
   }
 
-  const sessMatch = p.match(/^\/api\/projects\/([^/]+)\/sessions$/);
-  if (sessMatch && req.method === "GET") {
-    const pr = loadProjects().find((x) => x.id === sessMatch[1] || x.name === sessMatch[1]);
-    if (!pr) return json(res, 404, { error: "no such project" });
-    const dir = path.join(DATA_DIR, "projects", slug(pr.name), "sessions");
-    let files = [];
-    try {
-      files = fs
-        .readdirSync(dir)
-        .filter((f) => f.endsWith(".jsonl"))
-        .map((f) => {
-          const st = fs.statSync(path.join(dir, f));
-          return { file: f, mtime: st.mtimeMs, size: st.size };
-        })
-        .sort((a, b) => b.mtime - a.mtime)
-        .slice(0, 50);
-    } catch {}
-    return json(res, 200, { project: pr, sessions: files });
-  }
-  res.writeHead(404);
-  res.end("not found");
+  // ---- notifications ring (for the bell after a reload) ----
+  if (p === "/api/notifications") return json(res, 200, { events: pool.recentEvents ? pool.recentEvents(50) : [] });
+
+  json(res, 404, { error: "not found" });
 });
 
+// ---------- capabilities: real discovery + real enable/disable ----------
+function ompConfigDir() {
+  const home = process.env.USERPROFILE || process.env.HOME || "";
+  const d = path.join(home, ".omp", "agent");
+  return fs.existsSync(d) ? d : null;
+}
+function listDir(d) {
+  try { return fs.readdirSync(d).filter((f) => !f.startsWith(".")); } catch { return []; }
+}
+function capabilities() {
+  const dir = ompConfigDir();
+  if (!dir) return { available: false, skills: [], plugins: [], mcp: [] };
+  const mk = (root) =>
+    listDir(path.join(dir, root)).map((name) => ({ name, enabled: !name.endsWith(".disabled") })).sort((a, b) => a.name.localeCompare(b.name));
+  let mcp = [];
+  for (const f of ["mcp.json", "config.yml"]) {
+    const fp = path.join(dir, f);
+    if (!fs.existsSync(fp)) continue;
+    const txt = fs.readFileSync(fp, "utf8");
+    const names = [...txt.matchAll(/^\s{2}([A-Za-z0-9._-]+):\s*$/gm)].map((m) => m[1]);
+    if (f === "mcp.json") { try { mcp = Object.keys(JSON.parse(txt).mcpServers || {}); } catch {} }
+    else mcp = mcp.concat(names.filter((n) => /mcp|server/i.test(n)));
+  }
+  return { available: true, dir, skills: mk("skills"), plugins: mk("plugins"), mcp: [...new Set(mcp)] };
+}
+
 // ---------- websocket ----------
-const wss = new WebSocketServer({ noServer: true });
+const wss = new WebSocketServer({ noServer: true, maxPayload: 32 * 1024 * 1024 });
 server.on("upgrade", (req, socket, head) => {
   const url = new URL(req.url, "http://x");
-  if (url.pathname !== "/ws" && !url.pathname.startsWith("/ws/")) { socket.destroy(); return; }
-  if (!authed(req)) { socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n"); socket.destroy(); return; }
+  if (url.pathname !== "/ws" && url.pathname !== "/ws/control" && !url.pathname.startsWith("/ws/")) { socket.destroy(); return; }
+  if (!auth.authed(req)) { socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n"); socket.destroy(); return; }
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 });
 
+const RPC_ALLOW = new Set([
+  "get_state", "get_messages_page", "get_messages", "get_available_commands", "get_available_models",
+  "get_available_thinking_levels", "set_model", "cycle_model", "set_thinking_level", "cycle_thinking_level",
+  "compact", "set_auto_compaction", "set_auto_retry", "abort_retry", "bash", "abort_bash", "get_session_stats",
+  "switch_session", "set_session_name", "branch", "get_tree", "get_entries", "new_session", "open_session",
+  "handoff", "export_html", "set_steering_mode", "set_follow_up_mode", "get_branch_messages",
+  "get_last_assistant_text", "remove_queued_message", "get_subagents", "get_subagent_messages",
+  "set_subagent_subscription", "abort", "set_fast_mode", "set_todos", "get_todos",
+]);
+
 wss.on("connection", (ws, req) => {
   const url = new URL(req.url, "http://x");
-  const projectId = url.searchParams.get("project");
-  const resume = url.searchParams.get("resume"); // session file name or empty for new
-  const list = loadProjects();
-  const pr = list.find((x) => x.id === projectId || x.name === projectId);
-  if (!pr) { ws.send(JSON.stringify({ type: "server_event", event: "error", error: "unknown project" })); ws.close(); return; }
-  if (sessions.size >= MAX_SESSIONS && ![...sessions.values()].some((s) => s.project.id === pr.id)) {
-    ws.send(JSON.stringify({ type: "server_event", event: "error", error: `max ${MAX_SESSIONS} concurrent agent sessions` }));
-    ws.close();
+  if (url.pathname === "/ws/control") {
+    pool.subscribe(ws);
+    ws.send(JSON.stringify({ t: "notify_ready", sessions: pool.all().map((s) => ({ chatId: s.chatId, project: s.project.name, kind: s.kind, streaming: s.state.streaming })) }));
+    ws.on("close", () => pool.unsubscribe(ws));
     return;
   }
-  let s;
-  const existing = [...sessions.values()].find((x) => x.project.id === pr.id && (x.clients.size > 0 || Date.now() - x.lastActivity < 5 * 60e3));
-  if (existing && !resume) s = existing;
-  else s = ensureSession(pr, resume ? path.join(DATA_DIR, "projects", slug(pr.name), "sessions", resume) : null);
+  const projectId = url.searchParams.get("project");
+  const chatId = url.searchParams.get("chat") || `chat-${Math.random().toString(36).slice(2, 10)}`;
+  const kind = url.searchParams.get("kind") === "chat" ? "chat" : "work";
+  const approval = ["always-ask", "write", "yolo"].includes(url.searchParams.get("approval")) ? url.searchParams.get("approval") : "write";
+  const resume = url.searchParams.get("resume") || null;
+  const model = url.searchParams.get("model") || null;
+  const thinking = url.searchParams.get("thinking") || null;
+  const pr = projects.findProject(projectId);
+  if (!pr) { ws.send(JSON.stringify({ type: "server_event", event: "error", error: "unknown project" })); ws.close(); return; }
+  if (resume && !/^[A-Za-z0-9._-]+\.jsonl$/.test(resume)) { ws.send(JSON.stringify({ type: "server_event", event: "error", error: "bad resume file" })); ws.close(); return; }
 
+  const r = pool.open({ chatId, project: pr, kind, approval, resumeFile: resume, model, thinking });
+  if (r.error) { ws.send(JSON.stringify({ type: "server_event", event: "error", error: r.error })); ws.close(); return; }
+  const s = r.session;
   s.attach(ws);
-  ws.on("message", (data) => {
+  if (!r.reused) log(`chat ${chatId} -> ${pr.name} (${kind}/${approval}) cwd=${pr.path}`);
+
+  ws.on("message", async (data) => {
     let m;
     try { m = JSON.parse(String(data)); } catch { return; }
     s.lastActivity = Date.now();
     switch (m.t) {
-      case "prompt": s.rpc("prompt", { message: String(m.text || ""), images: m.images, streamingBehavior: m.streamingBehavior }); break;
-      case "steer": s.rpc("steer", { message: String(m.text || "") }); break;
+      case "prompt": {
+        const imgs = (m.images || []).map(images.toImageContent).filter(Boolean);
+        s.rpc("prompt", { message: String(m.text || ""), ...(imgs.length ? { images: imgs } : {}), ...(m.streamingBehavior ? { streamingBehavior: m.streamingBehavior } : {}) });
+        break;
+      }
+      case "steer": {
+        const imgs = (m.images || []).map(images.toImageContent).filter(Boolean);
+        s.rpc("steer", { message: String(m.text || ""), ...(imgs.length ? { images: imgs } : {}) });
+        break;
+      }
+      case "follow_up": s.rpc("follow_up", { message: String(m.text || "") }); break;
       case "abort": s.rpc("abort"); break;
+      case "dispose": s.dispose(); break;
       case "ui_response":
-      case "rpc": ws2rpc(s, m); break;
+      case "rpc": {
+        const f = m.frame;
+        if (!f || typeof f.type !== "string") break;
+        if (f.type === "extension_ui_response" || RPC_ALLOW.has(f.type)) s.send(f);
+        else s.broadcast({ type: "server_event", event: "error", error: `rpc command not allowed from client: ${f.type}` });
+        break;
+      }
       default: break;
     }
   });
   ws.on("close", () => s.clients.delete(ws));
 });
 
-const RPC_ALLOW = new Set([
-  "get_state", "get_messages_page", "get_messages", "get_available_commands", "get_available_models",
-  "set_model", "cycle_model", "set_thinking_level", "compact", "set_auto_compaction", "set_auto_retry",
-  "abort_retry", "bash", "abort_bash", "get_session_stats", "switch_session", "set_session_name",
-  "branch", "get_tree", "get_entries", "new_session", "open_session", "handoff", "export_html",
-  "set_steering_mode", "set_follow_up_mode", "set_interrupt_mode", "get_branch_messages",
-  "get_last_assistant_text", "remove_queued_message", "get_subagents", "get_subagent_messages",
-  "set_subagent_subscription", "abort", "set_fast_mode",
-]);
-function ws2rpc(s, m) {
-  const f = m.frame;
-  if (!f || typeof f.type !== "string") return;
-  if (f.type === "extension_ui_response" || RPC_ALLOW.has(f.type)) { s.send(f); return; }
-  s.broadcast({ type: "server_event", event: "error", error: `rpc command not allowed from client: ${f.type}` });
-}
-
-// ---------- boot ----------
-function log(...a) { console.log(new Date().toISOString().slice(11, 19), ...a); }
-
 server.listen(PORT, HOST, () => {
-  log(`omp-gui listening on http://${HOST}:${PORT} (omp: ${OMP_BIN}, data: ${DATA_DIR})`);
-  if (!passHash) log("WARNING: OMP_GUI_PASS_PLAINTEXT unset — login impossible; set it in .env");
+  log(`omp-gui v${VERSION} on http://${HOST}:${PORT} (omp: ${config.OMP_BIN}, data: ${DATA_DIR}, ire: ${config.IRE_ROOT})`);
+  if (!config.PASS) log("WARNING: OMP_GUI_PASS_PLAINTEXT unset — login impossible; set it in .env");
+  if (!images.configured()) log("WARNING: image generation unconfigured (ckff-image-url / ckff-cortex-image-generation)");
 });

@@ -20,9 +20,9 @@ jobs:
         run: cd server && npm install --omit=dev
       - name: Syntax check
         run: |
-          node --check server/index.js
-          node --check web/app.js
-          node --check scripts/smoke.js
+          for f in server/index.js server/lib/*.js web/app.js web/js/*.js scripts/smoke.js scripts/test-server.js; do
+            node --check "$f"
+          done
       - name: Auth + API smoke (no model calls)
         env:
           OMP_GUI_USER: ci
@@ -41,5 +41,11 @@ jobs:
           bad=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8790/api/login \
             -H 'content-type: application/json' -d '{"username":"ci","password":"nope-not-it"}')
           test "$bad" = 401
+      - name: API + isolation tests (one real agent turn)
+        env:
+          OMP_GUI_USER: ci
+          OMP_GUI_PASS_PLAINTEXT: ci-secret
+          OMP_GUI_SESSION_SECRET: ci-test-secret-0123456789abcdef
+        run: node scripts/test-server.js
       - name: Docker build
         run: docker build -t omp-gui:ci .

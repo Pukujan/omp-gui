@@ -47,6 +47,30 @@ Two options, pick one:
 - **Public (needs login hardening first, issue #6):** Cloudflare Tunnel
   (`cloudflared tunnel`) with the origin bound to `127.0.0.1` only.
 
+### Tunnel status (verified 2026-09-29, issue #7)
+
+Tunnel `85d1dc6c-a063-43ef-9d47-f26095331f25` (name `omp`) exists with the DNS
+CNAME in place, but it cannot be run from here yet:
+
+- `PUT /accounts/{acct}/tunnels/{id}/configuration` returns
+  `10405 Method not allowed for this authentication scheme` — the API token can
+  create/list/delete tunnels but cannot write tunnel configuration (that needs the
+  account certificate).
+- `config_src: local` tunnels therefore fail to register (`QUIC control stream
+  encountered a failure while serving`, http2 fallback `Failed to get tunnel`).
+
+Unblock (one interactive step on this machine):
+
+```bash
+cloudflared tunnel login                       # browser: authorize design-bakery.com
+cloudflared tunnel route dns omp omp.design-bakery.com
+cloudflared tunnel --config ~/.cloudflared/omp-gui.yml run
+```
+
+Ingress must point at `http://127.0.0.1:8790`. Until then, Tailscale
+(`tailscale serve --bg --https=443 http://127.0.0.1:8790`) is the working remote
+path — this workstation is `cortex` (100.67.111.75).
+
 WebSocket proxy config (Caddy):
 
 ```

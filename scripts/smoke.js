@@ -8,7 +8,7 @@ const WebSocket = require(path.join(__dirname, "..", "server", "node_modules", "
 const ENV = Object.fromEntries(
   fs.readFileSync(path.join(__dirname, "..", ".env"), "utf8")
     .split(/\r?\n/)
-    .map((l) => l.match(/^([A-Z0-9_]+)=(.*)$/i))
+    .map((l) => l.match(/^([A-Z0-9_-]+)=(.*)$/i))
     .filter(Boolean)
     .map((m) => [m[1], m[2]])
 );
@@ -47,15 +47,21 @@ const ok = (c, m) => { if (!c) throw new Error("FAIL: " + m); console.log("ok:",
   const cookie = (r.headers["set-cookie"] || []).find((c) => c.startsWith("omg_session=")).split(";")[0];
 
   r = await req("GET", "/api/me", null, cookie);
-  ok(r.status === 200 && JSON.parse(r.body).user === "pukujan", "me");
+  const me = JSON.parse(r.body);
+  ok(r.status === 200 && !!me.user, "me (" + me.user + ", v" + me.version + ")");
+
+  r = await req("GET", "/api/models?limit=5", null, cookie);
+  const ranked = JSON.parse(r.body);
+  ok(r.status === 200 && ranked.models?.length === 5, "ranked model picker (engine " + ranked.engineVersion + ", " + ranked.count + " models)");
 
   r = await req("POST", "/api/projects", { name: "smoke", path: process.env.TEMP + "\\omp-gui-smoke" }, cookie);
   if (r.status !== 200) { ok(r.status === 409, "project exists"); }
   const pr = JSON.parse((await req("GET", "/api/projects", null, cookie)).body).projects.find((p) => p.name === "smoke");
   ok(pr, "project listed");
 
-  // websocket: prompt the real agent
-  const ws = new WebSocket(`ws://127.0.0.1:8790/ws?project=${pr.id}`, { headers: { cookie } });
+  // websocket: prompt the real agent in its own chat (one process per chat)
+  const chatId = "smoke-" + Date.now().toString(36);
+  const ws = new WebSocket(`ws://127.0.0.1:8790/ws?project=${pr.id}&chat=${chatId}&kind=work&approval=write`, { headers: { cookie } });
   const frames = [];
   let gotText = "";
   let settled = false;
@@ -70,6 +76,7 @@ const ok = (c, m) => { if (!c) throw new Error("FAIL: " + m); console.log("ok:",
     frames.push(f.type + (f.command ? ":" + f.command : "") + (f.event ? ":" + f.event : ""));
     if (f.type === "message_update" && f.assistantMessageEvent?.type === "text_delta") gotText += f.assistantMessageEvent.delta;
     if (f.type === "session_settled") settled = true;
+    if (f.type === "server_event" && f.event === "hello") ok(f.chatId === chatId && f.ready !== undefined, "hello names the chat (" + f.chatId + ", kind " + f.kind + ")");
   });
   // wait for ready frame
   await new Promise((res) => setTimeout(res, 8000));
